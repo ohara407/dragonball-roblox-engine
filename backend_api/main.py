@@ -5,9 +5,14 @@ Fornece endpoints para:
 - Treinamento em tempo real (Flexões, Meditação, Sala do Tempo, Gravidade)
 - Ativação, drenagem e reversão de Transformações (SSJ 1-3, God, Blue, Ultra Instinct/Ego)
 - Sistema de Missões e Sagas
+- Sistema de Golpes Especiais e Habilidades (Kamehameha, Genki Dama, etc.)
+- Sistema de Loja, Itens e Inventário (Senzu Beans, Armaduras, Scouter)
+- Integração de IA Google Gemini (Roteiros de Animação VFX, Diálogos de Chefes, Missões Diárias)
 """
 import os
 import sys
+from typing import Optional, Dict
+from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -24,14 +29,26 @@ from engine import (
     process_training, transform_player, revert_transformation,
     drain_ki_tick, charge_ki, apply_zenkai_boost, recalculate_power_level
 )
+from skills import (
+    SKILL_CATALOG, PlayerSkillSet,
+    learn_skill, use_skill, get_player_skillset
+)
+from shop import (
+    ITEM_CATALOG, Inventory,
+    buy_item, use_item, get_inventory, get_shop_catalog
+)
+from gemini_ai import GeminiAIEngine
+
+# Instancia o motor de IA do Google
+ai_engine = GeminiAIEngine()
 
 app = FastAPI(
     title="Dragon Ball Roblox Backend API",
-    description="API Python integrada ao Roblox para controle de status, treinamento, transformações e missões.",
-    version="1.0.0"
+    description="API Python integrada ao Roblox para controle de status, treinamento, transformações, combate, loja e IA.",
+    version="1.2.0"
 )
 
-# Habilita CORS caso o cliente ou painéis externos acessem a API
+# Habilita CORS para requisições externas ou painéis
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,15 +62,51 @@ def startup_event():
     """Inicializa a base de dados SQLite ao subir o servidor."""
     init_db()
     print(">>> Servidor Dragon Ball Backend inicializado com sucesso!")
-    print(">>> Banco de dados SQLite pronto para conexões do Roblox.")
+    print(">>> Módulos carregados: Player, Combat, Skills, Shop, Gemini AI.")
 
 @app.get("/", tags=["Status"])
 def root():
     return {
         "status": "online",
         "service": "Dragon Ball Roblox Engine",
-        "message": "Servidor backend de combate e progressão ativo."
+        "version": "1.2.0",
+        "features": [
+            "Player & Stats Engine",
+            "8 Super Saiyan Transformations",
+            "15 Iconic Combat Skills",
+            "Zeni Shop & Inventory",
+            "Google Gemini AI Generative VFX & Dialogues",
+            "Roblox HttpService Bridge"
+        ]
     }
+
+# ==============================================================================
+# MODELOS DE REQUISIÇÃO AUXILIARES
+# ==============================================================================
+
+class LearnSkillRequest(BaseModel):
+    skill_id: str
+
+class UseSkillRequest(BaseModel):
+    skill_id: str
+    target_defense: int = 50
+    target_power: int = 1000
+
+class BuyItemRequest(BaseModel):
+    item_id: str
+    quantity: int = 1
+
+class UseItemRequest(BaseModel):
+    item_id: str
+
+class AnimationAIRequest(BaseModel):
+    skill_or_form: str
+
+class BossDialogueAIRequest(BaseModel):
+    boss_name: str
+    player_power: int
+    boss_power: int
+    situation: str
 
 # ==============================================================================
 # ROTAS DO JOGADOR
@@ -68,7 +121,7 @@ def get_player_data(user_id: int, username: str = "SaiyanWarrior"):
 
 @app.post("/api/player/{user_id}/charge_ki", response_model=ApiResponse, tags=["Player"])
 def charge_player_ki(user_id: int, amount: float = 30.0):
-    """Carrega o Ki do jogador (chamado quando o jogador segura a tecla de carga no Roblox)."""
+    """Carrega o Ki do jogador (chamado quando o jogador segura a tecla [C] no Roblox)."""
     player = get_player(user_id)
     if not player:
         raise HTTPException(status_code=404, detail="Jogador não encontrado")
@@ -183,7 +236,6 @@ def complete_quest(user_id: int, request: CompleteQuestRequest):
     if request.quest_id in player.completed_quests:
         return ApiResponse(success=False, message="Missão já foi concluída anteriormente.", player=player)
     
-    # Valida poder mínimo da missão
     if player.power_level < quest.power_level_req:
         return ApiResponse(
             success=False,
@@ -191,7 +243,6 @@ def complete_quest(user_id: int, request: CompleteQuestRequest):
             player=player
         )
     
-    # Registra conclusão e entrega recompensas
     player.completed_quests.append(request.quest_id)
     player.exp += quest.reward_exp
     player.zeni += quest.reward_zeni
@@ -210,6 +261,108 @@ def complete_quest(user_id: int, request: CompleteQuestRequest):
         message=f"Missão '{quest.title}' concluída com sucesso! +{quest.reward_exp} EXP, +{quest.reward_zeni} Zeni.{unlocked_msg}",
         player=player
     )
+
+# ==============================================================================
+# ROTAS DE GOLPES ESPECIAIS (SKILLS)
+# ==============================================================================
+
+@app.get("/api/skills", tags=["Habilidades"])
+def list_skills():
+    """Retorna todos os 15 golpes especiais com danos, custos de Ki e requisitos."""
+    return SKILL_CATALOG
+
+@app.get("/api/player/{user_id}/skills", response_model=PlayerSkillSet, tags=["Habilidades"])
+def get_skills_route(user_id: int):
+    """Retorna o conjunto de golpes aprendidos pelo jogador."""
+    return get_player_skillset(user_id)
+
+@app.post("/api/player/{user_id}/skills/learn", response_model=ApiResponse, tags=["Habilidades"])
+def learn_skill_route(user_id: int, request: LearnSkillRequest):
+    """Aprende uma nova habilidade caso atenda aos requisitos de nível e saga."""
+    player = get_player(user_id)
+    if not player:
+        raise HTTPException(status_code=404, detail="Jogador não encontrado")
+    
+    success, msg, skill = learn_skill(player, request.skill_id)
+    return ApiResponse(success=success, message=msg, player=player)
+
+@app.post("/api/player/{user_id}/skills/use", response_model=ApiResponse, tags=["Habilidades"])
+def use_skill_route(user_id: int, request: UseSkillRequest):
+    """Executa um golpe especial, deduzindo Ki e calculando o dano de combate."""
+    player = get_player(user_id)
+    if not player:
+        raise HTTPException(status_code=404, detail="Jogador não encontrado")
+    
+    success, msg, result = use_skill(player, request.skill_id, request.target_defense, request.target_power)
+    if success:
+        save_player(player)
+    return ApiResponse(success=success, message=msg, player=player, extra_data=result)
+
+# ==============================================================================
+# ROTAS DE LOJA E INVENTÁRIO
+# ==============================================================================
+
+@app.get("/api/shop/catalog", tags=["Loja & Inventário"])
+def get_catalog():
+    """Retorna todos os itens disponíveis na loja com preços em Zeni."""
+    return get_shop_catalog()
+
+@app.get("/api/player/{user_id}/inventory", response_model=Inventory, tags=["Loja & Inventário"])
+def get_player_inventory(user_id: int):
+    """Retorna o inventário de itens do jogador."""
+    return get_inventory(user_id)
+
+@app.post("/api/player/{user_id}/shop/buy", response_model=ApiResponse, tags=["Loja & Inventário"])
+def buy_item_route(user_id: int, request: BuyItemRequest):
+    """Compra um item na loja debitando Zeni da conta do jogador."""
+    player = get_player(user_id)
+    if not player:
+        raise HTTPException(status_code=404, detail="Jogador não encontrado")
+    
+    success, msg, inv = buy_item(player, request.item_id, request.quantity)
+    if success:
+        save_player(player)
+    return ApiResponse(success=success, message=msg, player=player, extra_data={"inventory": inv.model_dump() if hasattr(inv, "model_dump") else inv.dict()})
+
+@app.post("/api/player/{user_id}/inventory/use", response_model=ApiResponse, tags=["Loja & Inventário"])
+def use_item_route(user_id: int, request: UseItemRequest):
+    """Consome ou equipa um item do inventário (ex: Senzu Bean restaura 100% HP/Ki)."""
+    player = get_player(user_id)
+    if not player:
+        raise HTTPException(status_code=404, detail="Jogador não encontrado")
+    
+    success, msg, extra = use_item(player, request.item_id)
+    if success:
+        save_player(player)
+    return ApiResponse(success=success, message=msg, player=player, extra_data=extra)
+
+# ==============================================================================
+# ROTAS DE IA GENERATIVA (GOOGLE GEMINI)
+# ==============================================================================
+
+@app.post("/api/ai/animation_specs", tags=["Google Gemini AI"])
+def generate_animation_specs(request: AnimationAIRequest):
+    """Gera o design técnico de animações, keyframes e partículas VFX no Roblox com IA."""
+    result = ai_engine.generate_animation_script(request.skill_or_form)
+    return result
+
+@app.post("/api/ai/boss_dialogue", tags=["Google Gemini AI"])
+def generate_boss_dialogue(request: BossDialogueAIRequest):
+    """Gera falas dinâmicas e dramáticas de chefes de saga baseadas no poder do jogador."""
+    dialogue = ai_engine.generate_boss_dialogue(
+        request.boss_name,
+        request.player_power,
+        request.boss_power,
+        request.situation
+    )
+    return {"boss_name": request.boss_name, "dialogue": dialogue}
+
+@app.get("/api/ai/daily_quest", tags=["Google Gemini AI"])
+def generate_daily_quest(level: int = 1, form: str = "Forma Base"):
+    """Gera uma missão procedural personalizada com o auxílio do Gemini 1.5 Flash."""
+    quest = ai_engine.generate_daily_quest(level, form)
+    return quest
+
 
 if __name__ == "__main__":
     import uvicorn
